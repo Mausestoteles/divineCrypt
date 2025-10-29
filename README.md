@@ -2,7 +2,7 @@
 
 A two-party encrypted messaging demo where a central Python server relays registration, login, and inbox traffic while two CLI clients establish end-to-end chat keys. This edition is bathed in **Divine Flare**: hardened credential handling, vivid messaging, and detailed guidance so you can explore the system safely.
 
----
+Quickstart (demo only, still simplified):
 
 ## Contents
 
@@ -25,15 +25,48 @@ Optional but recommended:
 * `python -m venv .venv && source .venv/bin/activate` — keep dependencies contained
 * `uvicorn` auto-reload for development (`pip install "uvicorn[standard]"`)
 
+3) In another terminal, use client:
+   # register and save salt locally (demo only; insecure)
+   python client.py register_save_salt alice mypassword
+   python client.py register_save_salt bob mypassword2
+
+   # login (requires salt file created above for demo)
+   python client.py login alice mypassword
+   python client.py login bob mypassword2
+
+   # establish an end-to-end chat key between Alice (offer) and Bob (accept)
+   # Terminal A (Alice):
+   python client.py handshake_offer bob
+
+   # Terminal B (Bob):
+   python client.py handshake_poll
+   python client.py handshake_accept HANDSHAKE_ID_FROM_POLL
+
+   # Terminal A picks up the acceptance (delivered on next poll)
+   python client.py handshake_poll
+
+   # send a message from Alice to Bob using the derived chat key
+   python client.py send bob "Hello from the Divine Flare!"
+
+   # view inbox as Bob
+   python client.py inbox
+
+Security / Production notes:
+- The "Divine Flare" edition now uses **scrypt** (N=2^18, r=8, p=1, 64-byte output) with a server-side pepper to protect verifier material.
+- Messages and handshake payloads are relayed via the server but encrypted end-to-end with X25519-derived keys plus HKDF and ChaCha20-Poly1305.
+- This demo is intentionally simplified. For production:
+  * Use OPAQUE or an OPRF-based PAKE to avoid sending raw passwords to server endpoints.
+  * Always run behind TLS (HTTPS). Use proper certificate management.
+  * Store peppers in a separate secret manager or HSM, rotated with care.
+  * Use durable session storage (redis or SQL) with revocation, plus short TTLs.
+  * Add WebAuthn / 2FA for critical operations and audit logging.
+  * Have external cryptographers review the design and implementation end to end.
+
 ---
 
 ## Installation
 
-```bash
-# from the repo root
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+Das obige Paket ist eine praktisch lauffähige Demo der Architektur (Divine Flare Variante mit scrypt-Härte). Wenn du möchtest, kann ich jetzt:
 
 If using a virtual environment, activate it before installing.
 
