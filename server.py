@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Chimera-Sponge demo server (fallback design):
-- Flask server with endpoints: /register, /login, /handshake, /message/send, /message/get
-- Uses Argon2id (raw) + server pepper to store verifier
+Chimera-Sponge demo server (Divine Flare edition):
+- Flask server with endpoints: /register, /login, /handshake/send, /handshake/poll,
+  /message/send, /message/get
+- Uses scrypt (high cost) + server pepper to store verifier
 - Uses X25519 ephemeral DH + HKDF to produce symmetric keys for AEAD
 
 Run: CHIMERA_PEPPER must be set in environment before starting.
@@ -12,9 +13,8 @@ import json
 import sqlite3
 import secrets
 import time
+import hashlib
 from base64 import b64encode, b64decode
-from typing import Optional
-
 from flask import Flask, request, jsonify, g
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, hmac
@@ -22,13 +22,11 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import serialization
 
-# Argon2 low-level
-from argon2.low_level import hash_secret_raw, Type
-
 # Configuration
 DB_PATH = "users.db"
 SESSION_TTL = 3600  # seconds
 SERVER_PEPER_ENV = "CHIMERA_PEPPER"
+DIVINE_FLARE = "🔥 Divine Flare engaged"
 
 app = Flask(__name__)
 
@@ -60,30 +58,55 @@ def close_connection(exception):
 def init_db():
     db = sqlite3.connect(DB_PATH)
     c = db.cursor()
+
+    # Detect previous schema (Argon2 based) and rebuild if necessary
+    c.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in c.fetchall()]
+    if columns and 'scrypt_params' not in columns:
+        c.execute('DROP TABLE IF EXISTS users')
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             salt BLOB NOT NULL,
             verifier BLOB NOT NULL,
-            argon_params TEXT NOT NULL
+            scrypt_params TEXT NOT NULL
         )
     ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            ciphertext BLOB NOT NULL,
+            nonce BLOB NOT NULL,
+            aad BLOB,
+            ts INTEGER NOT NULL
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS handshakes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            ts INTEGER NOT NULL
+        )
+    ''')
+
+    c.execute('CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, ts DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_handshakes_recipient ON handshakes(recipient, ts DESC)')
+
     db.commit()
     db.close()
 
 # --- Crypto helpers ---
 
-def argon2id_derive(password: bytes, salt: bytes, time_cost=3, memory_kib=65536, parallelism=4, hash_len=32) -> bytes:
-    """Return raw bytes from Argon2id (low-level binding)."""
-    return hash_secret_raw(
-        secret=password,
-        salt=salt,
-        time_cost=time_cost,
-        memory_cost=memory_kib,
-        parallelism=parallelism,
-        hash_len=hash_len,
-        type=Type.ID,
-    )
+def scrypt_derive(password: bytes, salt: bytes, n: int = 2 ** 18, r: int = 8, p: int = 1, length: int = 64) -> bytes:
+    """Return raw bytes from scrypt with hardened parameters."""
+    return hashlib.scrypt(password=password, salt=salt, n=n, r=r, p=p, dklen=length)
 
 
 def hmac_sha256(key: bytes, data: bytes) -> bytes:
@@ -107,28 +130,38 @@ def register():
     data = request.get_json(force=True)
     username = data.get('username')
     password = data.get('password')
+    salt_b64 = data.get('salt')
     if not username or not password:
-        return jsonify({'error': 'username and password required'}), 400
+        return jsonify({'error': 'username and password required', 'divine_flare': DIVINE_FLARE}), 400
 
     db = get_db()
     c = db.cursor()
     # check exists
     c.execute('SELECT username FROM users WHERE username=?', (username,))
     if c.fetchone():
-        return jsonify({'error': 'user exists'}), 400
+        return jsonify({'error': 'user exists', 'divine_flare': DIVINE_FLARE}), 400
 
-    salt = secrets.token_bytes(16)
-    # Argon2 params (server chooses safe defaults)
-    argon_params = {'time': 3, 'memory_kib': 64*1024, 'parallelism': 4}
-    k_client = argon2id_derive(password.encode(), salt, **argon_params)
+    if salt_b64:
+        try:
+            salt = b64decode(salt_b64)
+        except Exception:
+            return jsonify({'error': 'invalid salt encoding', 'divine_flare': DIVINE_FLARE}), 400
+        if len(salt) < 16:
+            return jsonify({'error': 'salt too short', 'divine_flare': DIVINE_FLARE}), 400
+    else:
+        salt = secrets.token_bytes(32)
+
+    # scrypt params (server chooses hardened defaults)
+    scrypt_params = {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64}
+    k_client = scrypt_derive(password.encode(), salt, **scrypt_params)
     # Store verifier = HMAC(pepper, k_client)
     verifier = hmac_sha256(PEPPER, k_client)
 
-    c.execute('INSERT INTO users(username, salt, verifier, argon_params) VALUES (?, ?, ?, ?)',
-              (username, salt, verifier, json.dumps(argon_params)))
+    c.execute('INSERT INTO users(username, salt, verifier, scrypt_params) VALUES (?, ?, ?, ?)',
+              (username, salt, verifier, json.dumps(scrypt_params)))
     db.commit()
 
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'salt': b64encode(salt).decode(), 'params': scrypt_params, 'divine_flare': DIVINE_FLARE})
 
 
 @app.route('/login', methods=['POST'])
@@ -147,33 +180,33 @@ def login():
     password = data.get('password')
     client_epk_b64 = data.get('client_epk')
     if not username or not password or not client_epk_b64:
-        return jsonify({'error': 'username, password, client_epk required'}), 400
+        return jsonify({'error': 'username, password, client_epk required', 'divine_flare': DIVINE_FLARE}), 400
 
     db = get_db()
     c = db.cursor()
-    c.execute('SELECT salt, verifier, argon_params FROM users WHERE username=?', (username,))
+    c.execute('SELECT salt, verifier, scrypt_params FROM users WHERE username=?', (username,))
     row = c.fetchone()
     if not row:
-        return jsonify({'error': 'invalid credentials'}), 403
+        return jsonify({'error': 'invalid credentials', 'divine_flare': DIVINE_FLARE}), 403
 
     salt = row['salt']
     verifier = row['verifier']
-    argon_params = json.loads(row['argon_params'])
+    scrypt_params = json.loads(row['scrypt_params'])
 
     # derive k_client using same params
-    k_client = argon2id_derive(password.encode(), salt, **argon_params)
+    k_client = scrypt_derive(password.encode(), salt, **scrypt_params)
     # compute verifier candidate
     verifier_candidate = hmac_sha256(PEPPER, k_client)
     # constant-time compare
     if not secrets.compare_digest(verifier_candidate, verifier):
-        return jsonify({'error': 'invalid credentials'}), 403
+        return jsonify({'error': 'invalid credentials', 'divine_flare': DIVINE_FLARE}), 403
 
     # parse client epk
     try:
         client_epk_bytes = b64decode(client_epk_b64)
         client_epk = X25519PublicKey.from_public_bytes(client_epk_bytes)
     except Exception:
-        return jsonify({'error': 'invalid client_epk'}), 400
+        return jsonify({'error': 'invalid client_epk', 'divine_flare': DIVINE_FLARE}), 400
 
     # server ephemeral
     server_esk = X25519PrivateKey.generate()
@@ -197,7 +230,10 @@ def login():
         'server_esk_bytes': server_esk.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
     }
 
-    return jsonify({'token': token, 'server_epk': b64encode(server_epk_bytes).decode(), 'expires_at': int(expires_at)})
+    return jsonify({'token': token,
+                    'server_epk': b64encode(server_epk_bytes).decode(),
+                    'expires_at': int(expires_at),
+                    'divine_flare': DIVINE_FLARE})
 
 
 def get_session_from_header():
@@ -216,37 +252,142 @@ def get_session_from_header():
 
 @app.route('/message/send', methods=['POST'])
 def message_send():
-    """Send an encrypted message to server-stored inbox (demo). Requires Authorization: Bearer <token>
-    JSON: {"ciphertext": base64, "nonce": base64}
-    Server will store ciphertext in memory per user (simple inbox).
+    """Send an encrypted message to a peer via the server relay.
+    Requires Authorization: Bearer <token>
+    JSON: {"recipient": str, "ciphertext": base64, "nonce": base64, "aad": base64?}
+    Server stores ciphertext in persistent inbox for the recipient.
     """
     session = get_session_from_header()
     if not session:
-        return jsonify({'error': 'unauthenticated'}), 403
+        return jsonify({'error': 'unauthenticated', 'divine_flare': DIVINE_FLARE}), 403
 
     data = request.get_json(force=True)
+    recipient = data.get('recipient')
     ciphertext_b64 = data.get('ciphertext')
     nonce_b64 = data.get('nonce')
-    if not ciphertext_b64 or not nonce_b64:
-        return jsonify({'error': 'ciphertext and nonce required'}), 400
+    aad_b64 = data.get('aad')
+    if not recipient or not ciphertext_b64 or not nonce_b64:
+        return jsonify({'error': 'recipient, ciphertext and nonce required', 'divine_flare': DIVINE_FLARE}), 400
 
-    # simple inbox storage in session
-    inbox = session.setdefault('inbox', [])
-    inbox.append({'ciphertext': ciphertext_b64, 'nonce': nonce_b64, 'ts': int(time.time())})
-    return jsonify({'ok': True})
+    db = get_db()
+    c = db.cursor()
+    c.execute('SELECT 1 FROM users WHERE username=?', (recipient,))
+    if not c.fetchone():
+        return jsonify({'error': 'recipient not found', 'divine_flare': DIVINE_FLARE}), 404
+
+    ts = int(time.time())
+    c.execute('INSERT INTO messages(sender, recipient, ciphertext, nonce, aad, ts) VALUES (?, ?, ?, ?, ?, ?)',
+              (session['username'], recipient, ciphertext_b64, nonce_b64, aad_b64, ts))
+    db.commit()
+
+    return jsonify({'ok': True, 'ts': ts, 'divine_flare': DIVINE_FLARE})
 
 
 @app.route('/message/get', methods=['GET'])
 def message_get():
     session = get_session_from_header()
     if not session:
-        return jsonify({'error': 'unauthenticated'}), 403
-    inbox = session.get('inbox', [])
-    return jsonify({'messages': inbox})
+        return jsonify({'error': 'unauthenticated', 'divine_flare': DIVINE_FLARE}), 403
+
+    after_id = request.args.get('after_id', type=int)
+    limit = min(request.args.get('limit', 50, type=int), 200)
+
+    db = get_db()
+    c = db.cursor()
+    if after_id:
+        c.execute('SELECT id, sender, ciphertext, nonce, aad, ts FROM messages WHERE recipient=? AND id>? ORDER BY id ASC LIMIT ?',
+                  (session['username'], after_id, limit))
+    else:
+        c.execute('SELECT id, sender, ciphertext, nonce, aad, ts FROM messages WHERE recipient=? ORDER BY id ASC LIMIT ?',
+                  (session['username'], limit))
+    rows = c.fetchall()
+    messages = [
+        {
+            'id': row['id'],
+            'sender': row['sender'],
+            'ciphertext': row['ciphertext'],
+            'nonce': row['nonce'],
+            'aad': row['aad'],
+            'ts': row['ts'],
+        }
+        for row in rows
+    ]
+
+    return jsonify({'messages': messages, 'divine_flare': DIVINE_FLARE})
+
+
+@app.route('/handshake/send', methods=['POST'])
+def handshake_send():
+    """Store a handshake payload addressed to another user."""
+    session = get_session_from_header()
+    if not session:
+        return jsonify({'error': 'unauthenticated', 'divine_flare': DIVINE_FLARE}), 403
+
+    data = request.get_json(force=True)
+    recipient = data.get('recipient')
+    payload_b64 = data.get('payload')
+    if not recipient or not payload_b64:
+        return jsonify({'error': 'recipient and payload required', 'divine_flare': DIVINE_FLARE}), 400
+
+    try:
+        payload = b64decode(payload_b64)
+    except Exception:
+        return jsonify({'error': 'invalid payload encoding', 'divine_flare': DIVINE_FLARE}), 400
+
+    db = get_db()
+    c = db.cursor()
+    c.execute('SELECT 1 FROM users WHERE username=?', (recipient,))
+    if not c.fetchone():
+        return jsonify({'error': 'recipient not found', 'divine_flare': DIVINE_FLARE}), 404
+
+    ts = int(time.time())
+    c.execute('INSERT INTO handshakes(sender, recipient, payload, ts) VALUES (?, ?, ?, ?)',
+              (session['username'], recipient, payload, ts))
+    handshake_id = c.lastrowid
+    db.commit()
+
+    return jsonify({'ok': True, 'handshake_id': handshake_id, 'ts': ts, 'divine_flare': DIVINE_FLARE})
+
+
+@app.route('/handshake/poll', methods=['GET'])
+def handshake_poll():
+    session = get_session_from_header()
+    if not session:
+        return jsonify({'error': 'unauthenticated', 'divine_flare': DIVINE_FLARE}), 403
+
+    after_id = request.args.get('after_id', type=int)
+    consume = request.args.get('consume', '0') in {'1', 'true', 'True'}
+    limit = min(request.args.get('limit', 50, type=int), 200)
+
+    db = get_db()
+    c = db.cursor()
+    if after_id:
+        c.execute('SELECT id, sender, payload, ts FROM handshakes WHERE recipient=? AND id>? ORDER BY id ASC LIMIT ?',
+                  (session['username'], after_id, limit))
+    else:
+        c.execute('SELECT id, sender, payload, ts FROM handshakes WHERE recipient=? ORDER BY id ASC LIMIT ?',
+                  (session['username'], limit))
+    rows = c.fetchall()
+    handshakes = [
+        {
+            'id': row['id'],
+            'sender': row['sender'],
+            'payload': b64encode(row['payload']).decode(),
+            'ts': row['ts'],
+        }
+        for row in rows
+    ]
+
+    if consume and rows:
+        ids = [row['id'] for row in rows]
+        c.execute('DELETE FROM handshakes WHERE id IN ({})'.format(','.join('?' for _ in ids)), ids)
+        db.commit()
+
+    return jsonify({'handshakes': handshakes, 'divine_flare': DIVINE_FLARE})
 
 
 if __name__ == '__main__':
     init_db()
     print('Starting Chimera-Sponge demo server on http://127.0.0.1:5000')
-    print('Make sure to run behind TLS in production and set CHIMERA_PEPPER in env')
+    print('Make sure to run behind TLS in production and set CHIMERA_PEPPER in env — Divine Flare active!')
     app.run(host='127.0.0.1', port=5000, debug=True)
