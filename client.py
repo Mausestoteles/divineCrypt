@@ -34,16 +34,6 @@ BASE = os.environ.get('CHIMERA_SERVER', 'http://127.0.0.1:5000')
 # Divine Flare banner
 DIVINE_FLARE = "🔥 Divine Flare engaged"
 
-# Align with server presets so the client can understand fallback notes.
-SCRYPT_PRESETS = [
-    {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 17, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 16, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 15, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 14, 'r': 8, 'p': 1, 'length': 64},
-]
-DEFAULT_SCRYPT_PARAMS = SCRYPT_PRESETS[0]
-
 # Local session state (in-memory for demo)
 LOCAL = {
     'username': None,
@@ -57,8 +47,7 @@ LOCAL = {
     'peer_chat_keys': {},    # peer username -> bytes
 }
 
-def scrypt_derive(password: bytes, salt: bytes, n: int = DEFAULT_SCRYPT_PARAMS['n'], r: int = DEFAULT_SCRYPT_PARAMS['r'],
-                  p: int = DEFAULT_SCRYPT_PARAMS['p'], length: int = DEFAULT_SCRYPT_PARAMS['length']) -> bytes:
+def scrypt_derive(password: bytes, salt: bytes, n: int = 2 ** 18, r: int = 8, p: int = 1, length: int = 64) -> bytes:
     return hashlib.scrypt(password=password, salt=salt, n=n, r=r, p=p, dklen=length)
 
 
@@ -102,9 +91,6 @@ def register(username: str, password: str, salt: Optional[bytes] = None):
         return None
 
     print(f"{DIVINE_FLARE} Registered {username}. Server salt (base64): {j.get('salt')}")
-    params = j.get('params')
-    if params and params != DEFAULT_SCRYPT_PARAMS:
-        print(f"{DIVINE_FLARE} Server adjusted scrypt params to n={params['n']}, r={params['r']}, p={params['p']} to respect memory limits.")
     return j
 
 
@@ -132,34 +118,15 @@ def login(username: str, password: str):
     if not os.path.exists(salt_file):
         print(f"{DIVINE_FLARE} Salt file {salt_file} not found. Run register_save_salt first to capture the server salt.")
         return False
-    with open(salt_file, 'rb') as fh:
-        salt = fh.read()
+    salt = open(salt_file, 'rb').read()
 
     params_path = f"scrypt_{username}.json"
-    params_from_server = j.get('params')
-    if isinstance(params_from_server, dict):
-        scrypt_params = params_from_server
-        try:
-            with open(params_path, 'w', encoding='utf-8') as fh:
-                json.dump(scrypt_params, fh)
-        except OSError as exc:
-            print(f"{DIVINE_FLARE} Warning: could not persist scrypt parameters to {params_path}: {exc}")
-    elif params_from_server is not None:
-        print(f"{DIVINE_FLARE} Warning: unexpected params payload from server, falling back to local copy.")
-        if os.path.exists(params_path):
-            with open(params_path, 'r', encoding='utf-8') as fh:
-                scrypt_params = json.load(fh)
-        else:
-            scrypt_params = DEFAULT_SCRYPT_PARAMS
-    elif os.path.exists(params_path):
+    if os.path.exists(params_path):
         with open(params_path, 'r', encoding='utf-8') as fh:
             scrypt_params = json.load(fh)
     else:
-        # fallback to defaults if server omitted params
-        scrypt_params = DEFAULT_SCRYPT_PARAMS
-
-    if scrypt_params != DEFAULT_SCRYPT_PARAMS:
-        print(f"{DIVINE_FLARE} Using scrypt params n={scrypt_params['n']}, r={scrypt_params['r']}, p={scrypt_params['p']} as provided by the server.")
+        # fallback to server defaults
+        scrypt_params = {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64}
 
     k_client = scrypt_derive(password.encode(), salt, **scrypt_params)
 

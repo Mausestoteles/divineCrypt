@@ -15,7 +15,6 @@ import secrets
 import time
 import hashlib
 from base64 import b64encode, b64decode
-from typing import Optional
 from flask import Flask, request, jsonify, g
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, hmac
@@ -28,15 +27,6 @@ DB_PATH = "users.db"
 SESSION_TTL = 3600  # seconds
 SERVER_PEPER_ENV = "CHIMERA_PEPPER"
 DIVINE_FLARE = "🔥 Divine Flare engaged"
-
-# Scrypt presets ordered from most to least demanding.
-SCRYPT_PRESETS = [
-    {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 17, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 16, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 15, 'r': 8, 'p': 1, 'length': 64},
-    {'n': 2 ** 14, 'r': 8, 'p': 1, 'length': 64},
-]
 
 app = Flask(__name__)
 
@@ -119,28 +109,6 @@ def scrypt_derive(password: bytes, salt: bytes, n: int = 2 ** 18, r: int = 8, p:
     return hashlib.scrypt(password=password, salt=salt, n=n, r=r, p=p, dklen=length)
 
 
-def scrypt_with_fallback(password: bytes, salt: bytes, preferred: Optional[dict] = None):
-    """Try deriving with preferred params, falling back to lighter presets.
-
-    Returns (derived_key, params_used, preset_index).
-    """
-
-    candidates = []
-    if preferred:
-        candidates.append(preferred)
-    candidates.extend(p for p in SCRYPT_PRESETS if p not in candidates)
-
-    last_error = None
-    for idx, params in enumerate(candidates):
-        try:
-            return scrypt_derive(password, salt, **params), params, idx
-        except (ValueError, MemoryError) as exc:
-            last_error = exc
-            continue
-
-    raise ValueError('scrypt derivation failed for all parameter presets') from last_error
-
-
 def hmac_sha256(key: bytes, data: bytes) -> bytes:
     h = hmac.HMAC(key, hashes.SHA256())
     h.update(data)
@@ -184,15 +152,8 @@ def register():
         salt = secrets.token_bytes(32)
 
     # scrypt params (server chooses hardened defaults)
-    preferred_params = SCRYPT_PRESETS[0]
-    try:
-        k_client, scrypt_params, preset_index = scrypt_with_fallback(password.encode(), salt, preferred=preferred_params)
-    except ValueError:
-        return jsonify({'error': 'scrypt derivation failed — please retry later', 'divine_flare': DIVINE_FLARE}), 500
-
-    if preset_index > 0:
-        print(f"{DIVINE_FLARE} Scrypt fallback activated for {username}: using n={scrypt_params['n']}, r={scrypt_params['r']}, p={scrypt_params['p']}")
-
+    scrypt_params = {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64}
+    k_client = scrypt_derive(password.encode(), salt, **scrypt_params)
     # Store verifier = HMAC(pepper, k_client)
     verifier = hmac_sha256(PEPPER, k_client)
 
@@ -272,7 +233,6 @@ def login():
     return jsonify({'token': token,
                     'server_epk': b64encode(server_epk_bytes).decode(),
                     'expires_at': int(expires_at),
-                    'params': scrypt_params,
                     'divine_flare': DIVINE_FLARE})
 
 
