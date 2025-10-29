@@ -3,18 +3,24 @@
 Chimera-Sponge demo client.
 Usage (examples):
   python client.py register alice mypassword
+  python client.py register_save_salt alice mypassword
   python client.py login alice mypassword
-  python client.py send "Hello world"
+  python client.py handshake_offer bob
+  python client.py handshake_poll
+  python client.py handshake_accept HANDSHAKE_ID
+  python client.py send bob "Hello world"
   python client.py inbox
 
-The client stores a local client_key derived from password (Argon2id) in memory only.
+The client stores a local client_key derived from password (scrypt) in memory only.
 """
 
 import sys
-import json
-import requests
 import os
 import secrets
+import hashlib
+import json
+from typing import Optional, Dict
+import requests
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import serialization, hashes
@@ -25,6 +31,19 @@ from cryptography.hazmat.primitives import hmac
 # Server base URL
 BASE = os.environ.get('CHIMERA_SERVER', 'http://127.0.0.1:5000')
 
+# Divine Flare banner
+DIVINE_FLARE = "🔥 Divine Flare engaged"
+
+# Align with server presets so the client can understand fallback notes.
+SCRYPT_PRESETS = [
+    {'n': 2 ** 18, 'r': 8, 'p': 1, 'length': 64},
+    {'n': 2 ** 17, 'r': 8, 'p': 1, 'length': 64},
+    {'n': 2 ** 16, 'r': 8, 'p': 1, 'length': 64},
+    {'n': 2 ** 15, 'r': 8, 'p': 1, 'length': 64},
+    {'n': 2 ** 14, 'r': 8, 'p': 1, 'length': 64},
+]
+DEFAULT_SCRYPT_PARAMS = SCRYPT_PRESETS[0]
+
 # Local session state (in-memory for demo)
 LOCAL = {
     'username': None,
@@ -33,21 +52,14 @@ LOCAL = {
     'client_epk_bytes': None,
     'token': None,
     'root_key': None,
+    'handshake_offers': {},  # handshake_id -> private key
+    'handshake_cache': {},   # handshake_id -> decoded payload
+    'peer_chat_keys': {},    # peer username -> bytes
 }
 
-# Argon2 low-level (must match server parameters)
-from argon2.low_level import hash_secret_raw, Type
-
-def argon2id_derive(password: bytes, salt: bytes, time_cost=3, memory_kib=65536, parallelism=4, hash_len=32) -> bytes:
-    return hash_secret_raw(
-        secret=password,
-        salt=salt,
-        time_cost=time_cost,
-        memory_cost=memory_kib,
-        parallelism=parallelism,
-        hash_len=hash_len,
-        type=Type.ID,
-    )
+def scrypt_derive(password: bytes, salt: bytes, n: int = DEFAULT_SCRYPT_PARAMS['n'], r: int = DEFAULT_SCRYPT_PARAMS['r'],
+                  p: int = DEFAULT_SCRYPT_PARAMS['p'], length: int = DEFAULT_SCRYPT_PARAMS['length']) -> bytes:
+    return hashlib.scrypt(password=password, salt=salt, n=n, r=r, p=p, dklen=length)
 
 
 def hkdf_expand(shared: bytes, info: bytes = b'chimera-root', length: int = 32) -> bytes:
@@ -61,9 +73,39 @@ def hmac_sha256_bytes(key: bytes, data: bytes) -> bytes:
     return h.finalize()
 
 
-def register(username: str, password: str):
-    r = requests.post(BASE + '/register', json={'username': username, 'password': password})
-    print(r.status_code, r.text)
+def ensure_logged_in() -> bool:
+    if not LOCAL['token'] or not LOCAL['root_key']:
+        print(f"{DIVINE_FLARE} Not logged in. Run the login command first.")
+        return False
+    return True
+
+
+def auth_headers() -> Dict[str, str]:
+    if not LOCAL['token']:
+        raise RuntimeError('No session token available')
+    return {'Authorization': 'Bearer ' + LOCAL['token']}
+
+
+def register(username: str, password: str, salt: Optional[bytes] = None):
+    payload = {'username': username, 'password': password}
+    if salt is not None:
+        payload['salt'] = b64encode(salt).decode()
+    r = requests.post(BASE + '/register', json=payload)
+    try:
+        j = r.json()
+    except ValueError:
+        print(f"Register request failed {r.status_code}: {r.text}")
+        return None
+
+    if r.status_code != 200:
+        print(f"{DIVINE_FLARE} Register failed {r.status_code}: {j}")
+        return None
+
+    print(f"{DIVINE_FLARE} Registered {username}. Server salt (base64): {j.get('salt')}")
+    params = j.get('params')
+    if params and params != DEFAULT_SCRYPT_PARAMS:
+        print(f"{DIVINE_FLARE} Server adjusted scrypt params to n={params['n']}, r={params['r']}, p={params['p']} to respect memory limits.")
+    return j
 
 
 def login(username: str, password: str):
@@ -75,7 +117,7 @@ def login(username: str, password: str):
 
     r = requests.post(BASE + '/login', json={'username': username, 'password': password, 'client_epk': client_epk_b64})
     if r.status_code != 200:
-        print('Login failed', r.status_code, r.text)
+        print(f"{DIVINE_FLARE} Login failed {r.status_code}: {r.text}")
         return False
     j = r.json()
     token = j['token']
@@ -86,23 +128,40 @@ def login(username: str, password: str):
     # derive shared secret
     ss = client_esk.exchange(server_epk)
 
-    # Derive k_client locally (we need salt & argon params from server DB — but in this simple flow client doesn't have them.
-    # For demo we derive k_client again by contacting the DB via a convenience endpoint (not provided). To keep this simple,
-    # assume client computed k_client using same params and salt known out-of-band or stored locally (not secure). For demo,
-    # we will request the salt by simulating a second endpoint; instead, we will proceed with a simplified assumption:
-
-    # WARNING: In this demo the client cannot recompute k_client without salt. In real flow, the client would either know salt
-    # from registration step or run OPAQUE. For demo, assume user stored salt locally in a file after registration. We'll try to load it.
-
     salt_file = f"salt_{username}.bin"
     if not os.path.exists(salt_file):
-        print('Salt file not found locally. Login demo requires the salt file created at registration time (salt_USERNAME.bin).')
-        print('Use the register command in this demo, which saves salt locally.')
+        print(f"{DIVINE_FLARE} Salt file {salt_file} not found. Run register_save_salt first to capture the server salt.")
         return False
-    salt = open(salt_file, 'rb').read()
-    # Argon2 params must match server defaults
-    argon_params = {'time': 3, 'memory_kib': 64*1024, 'parallelism': 4}
-    k_client = argon2id_derive(password.encode(), salt, **argon_params)
+    with open(salt_file, 'rb') as fh:
+        salt = fh.read()
+
+    params_path = f"scrypt_{username}.json"
+    params_from_server = j.get('params')
+    if isinstance(params_from_server, dict):
+        scrypt_params = params_from_server
+        try:
+            with open(params_path, 'w', encoding='utf-8') as fh:
+                json.dump(scrypt_params, fh)
+        except OSError as exc:
+            print(f"{DIVINE_FLARE} Warning: could not persist scrypt parameters to {params_path}: {exc}")
+    elif params_from_server is not None:
+        print(f"{DIVINE_FLARE} Warning: unexpected params payload from server, falling back to local copy.")
+        if os.path.exists(params_path):
+            with open(params_path, 'r', encoding='utf-8') as fh:
+                scrypt_params = json.load(fh)
+        else:
+            scrypt_params = DEFAULT_SCRYPT_PARAMS
+    elif os.path.exists(params_path):
+        with open(params_path, 'r', encoding='utf-8') as fh:
+            scrypt_params = json.load(fh)
+    else:
+        # fallback to defaults if server omitted params
+        scrypt_params = DEFAULT_SCRYPT_PARAMS
+
+    if scrypt_params != DEFAULT_SCRYPT_PARAMS:
+        print(f"{DIVINE_FLARE} Using scrypt params n={scrypt_params['n']}, r={scrypt_params['r']}, p={scrypt_params['p']} as provided by the server.")
+
+    k_client = scrypt_derive(password.encode(), salt, **scrypt_params)
 
     # combine ss + k_client to produce root_key
     combined = ss + k_client
@@ -115,69 +174,237 @@ def login(username: str, password: str):
     LOCAL['client_epk_bytes'] = client_epk_bytes
     LOCAL['token'] = token
     LOCAL['root_key'] = root_key
-    print('Login success. Token stored in memory for demo.')
+    LOCAL['handshake_offers'].clear()
+    LOCAL['handshake_cache'].clear()
+    LOCAL['peer_chat_keys'].clear()
+    print(f"{DIVINE_FLARE} Login success. Token stored in memory for demo.")
     return True
 
 
 def register_and_save_salt(username: str, password: str):
-    # register then read DB salt via local helper? For demo, we do registration and save the salt client-side.
-    # In secure real systems, client should keep salt locally or use OPAQUE. This demo saves the salt to a local file to allow login.
-    r = requests.post(BASE + '/register', json={'username': username, 'password': password})
-    print('Register response:', r.status_code, r.text)
-    if r.status_code == 200:
-        # The demo server generated salt server-side; but client doesn't know it. Insecurely, ask server for it — we skip that.
-        # Instead, derive a client-side salt deterministically for demo only (do NOT do this in production)
-        salt = secrets.token_bytes(16)
-        open(f"salt_{username}.bin", 'wb').write(salt)
-        print(f"Saved demo salt locally to salt_{username}.bin — use this for login demo (insecure!)")
-
-
-def encrypt_and_send(plaintext: str):
-    if not LOCAL['token'] or not LOCAL['root_key']:
-        print('Not logged in or missing session')
+    response = register(username, password)
+    if not response:
         return
-    root_key = LOCAL['root_key']
-    # derive AEAD key
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'chimera-aead')
-    aead_key = hkdf.derive(root_key)
+    salt_b64 = response.get('salt')
+    params = response.get('params')
+    if not salt_b64:
+        print(f"{DIVINE_FLARE} Server did not return a salt payload.")
+        return
+    salt = b64decode(salt_b64)
+    salt_path = f"salt_{username}.bin"
+    with open(salt_path, 'wb') as fh:
+        fh.write(salt)
+    print(f"{DIVINE_FLARE} Saved salt to {salt_path}. Keep it secret!")
+    if params:
+        params_path = f"scrypt_{username}.json"
+        with open(params_path, 'w', encoding='utf-8') as fh:
+            json.dump(params, fh)
+        print(f"{DIVINE_FLARE} Stored scrypt parameters to {params_path}.")
+
+
+def encrypt_and_send(recipient: str, plaintext: str):
+    if not ensure_logged_in():
+        return
+    chat_secret = LOCAL['peer_chat_keys'].get(recipient)
+    if not chat_secret:
+        print(f"{DIVINE_FLARE} No chat key for {recipient}. Run handshake_offer and have them accept.")
+        return
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+               info=b'chimera-aead-' + recipient.encode())
+    aead_key = hkdf.derive(chat_secret)
     aead = ChaCha20Poly1305(aead_key)
     nonce = secrets.token_bytes(12)
-    aad = b''
+    aad = DIVINE_FLARE.encode()
     ct = aead.encrypt(nonce, plaintext.encode(), aad)
-    r = requests.post(BASE + '/message/send', json={'ciphertext': b64encode(ct).decode(), 'nonce': b64encode(nonce).decode()}, headers={'Authorization': 'Bearer ' + LOCAL['token']})
-    print('Send:', r.status_code, r.text)
+    payload = {
+        'recipient': recipient,
+        'ciphertext': b64encode(ct).decode(),
+        'nonce': b64encode(nonce).decode(),
+        'aad': b64encode(aad).decode(),
+    }
+    r = requests.post(BASE + '/message/send', json=payload, headers=auth_headers())
+    if r.status_code == 200:
+        print(f"{DIVINE_FLARE} Sent message to {recipient}.")
+    else:
+        print(f"{DIVINE_FLARE} Send failed {r.status_code}: {r.text}")
 
 
-def inbox():
-    if not LOCAL['token'] or not LOCAL['root_key']:
-        print('Not logged in')
+def handshake_offer(recipient: str):
+    if not ensure_logged_in():
         return
-    r = requests.get(BASE + '/message/get', headers={'Authorization': 'Bearer ' + LOCAL['token']})
+    offer_priv = X25519PrivateKey.generate()
+    offer_pub = offer_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw,
+                                                     format=serialization.PublicFormat.Raw)
+    payload = {
+        'type': 'offer',
+        'ephemeral_pub': b64encode(offer_pub).decode(),
+        'divine_flare': DIVINE_FLARE,
+    }
+    payload_b64 = b64encode(json.dumps(payload).encode()).decode()
+    r = requests.post(BASE + '/handshake/send', json={'recipient': recipient, 'payload': payload_b64},
+                      headers=auth_headers())
     if r.status_code != 200:
-        print('Failed to fetch inbox', r.status_code, r.text)
+        print(f"{DIVINE_FLARE} Handshake offer failed {r.status_code}: {r.text}")
+        return
+    try:
+        response_json = r.json()
+    except ValueError:
+        print(f"{DIVINE_FLARE} Unexpected handshake response: {r.text}")
+        return
+    handshake_id = response_json.get('handshake_id')
+    if handshake_id is None:
+        print(f"{DIVINE_FLARE} Handshake offer response missing id: {response_json}")
+        return
+    LOCAL['handshake_offers'][handshake_id] = offer_priv
+    LOCAL['handshake_cache'][handshake_id] = {
+        'id': handshake_id,
+        'recipient': recipient,
+        'decoded': payload,
+    }
+    print(f"{DIVINE_FLARE} Sent handshake offer {handshake_id} to {recipient}.")
+
+
+def handshake_poll(consume: bool = True):
+    if not ensure_logged_in():
+        return
+    params = {'consume': '1' if consume else '0'}
+    r = requests.get(BASE + '/handshake/poll', params=params, headers=auth_headers())
+    if r.status_code != 200:
+        print(f"{DIVINE_FLARE} Handshake poll failed {r.status_code}: {r.text}")
+        return
+    try:
+        body = r.json()
+    except ValueError:
+        print(f"{DIVINE_FLARE} Invalid handshake poll response: {r.text}")
+        return
+    entries = body.get('handshakes', [])
+    if not entries:
+        print(f"{DIVINE_FLARE} No handshake messages waiting.")
+        return
+    for entry in entries:
+        handshake_id = entry.get('id')
+        if handshake_id is None:
+            print(f"{DIVINE_FLARE} Encountered handshake entry without id: {entry}")
+            continue
+        payload_b64 = entry.get('payload')
+        decoded_payload = None
+        if payload_b64:
+            try:
+                payload_bytes = b64decode(payload_b64)
+                decoded_payload = json.loads(payload_bytes.decode())
+            except Exception:
+                decoded_payload = {'raw': payload_b64}
+        entry['decoded'] = decoded_payload
+        LOCAL['handshake_cache'][handshake_id] = entry
+        sender = entry.get('sender', '<unknown>')
+        if not decoded_payload:
+            print(f"{DIVINE_FLARE} Handshake {handshake_id} from {sender}: unable to parse payload.")
+            continue
+        payload_type = decoded_payload.get('type')
+        if payload_type == 'offer':
+            print(f"{DIVINE_FLARE} Handshake offer {handshake_id} from {sender}. Run handshake_accept {handshake_id} to respond.")
+        elif payload_type == 'accept':
+            offer_id = decoded_payload.get('offer_id')
+            remote_epk_b64 = decoded_payload.get('ephemeral_pub')
+            if offer_id in LOCAL['handshake_offers'] and remote_epk_b64:
+                offer_priv = LOCAL['handshake_offers'].pop(offer_id)
+                remote_pub = X25519PublicKey.from_public_bytes(b64decode(remote_epk_b64))
+                shared = offer_priv.exchange(remote_pub)
+                peer_key = hkdf_expand(shared, info=b'chimera-divine-chat', length=32)
+                LOCAL['peer_chat_keys'][sender] = peer_key
+                print(f"{DIVINE_FLARE} Handshake with {sender} completed. Chat key ready.")
+            else:
+                print(f"{DIVINE_FLARE} Received accept for unknown offer {offer_id} from {sender}.")
+        else:
+            print(f"{DIVINE_FLARE} Handshake {handshake_id} from {sender}: {decoded_payload}.")
+
+
+def handshake_accept(handshake_id_raw: str):
+    if not ensure_logged_in():
+        return
+    try:
+        handshake_id = int(handshake_id_raw)
+    except ValueError:
+        print(f"{DIVINE_FLARE} Invalid handshake id {handshake_id_raw}.")
+        return
+    entry = LOCAL['handshake_cache'].get(handshake_id)
+    if not entry:
+        print(f"{DIVINE_FLARE} Handshake {handshake_id} not cached. Run handshake_poll first.")
+        return
+    payload = entry.get('decoded')
+    if not payload or payload.get('type') != 'offer':
+        print(f"{DIVINE_FLARE} Handshake {handshake_id} is not an offer.")
+        return
+    remote_epk_b64 = payload.get('ephemeral_pub')
+    if not remote_epk_b64:
+        print(f"{DIVINE_FLARE} Offer {handshake_id} missing ephemeral key.")
+        return
+    remote_pub = X25519PublicKey.from_public_bytes(b64decode(remote_epk_b64))
+    priv = X25519PrivateKey.generate()
+    shared = priv.exchange(remote_pub)
+    peer_key = hkdf_expand(shared, info=b'chimera-divine-chat', length=32)
+    sender = entry.get('sender', '<unknown>')
+    if sender == '<unknown>':
+        print(f"{DIVINE_FLARE} Cannot respond to handshake without sender metadata.")
+        return
+    LOCAL['peer_chat_keys'][sender] = peer_key
+    response_payload = {
+        'type': 'accept',
+        'offer_id': handshake_id,
+        'ephemeral_pub': b64encode(priv.public_key().public_bytes(encoding=serialization.Encoding.Raw,
+                                                                 format=serialization.PublicFormat.Raw)).decode(),
+        'divine_flare': DIVINE_FLARE,
+    }
+    response_b64 = b64encode(json.dumps(response_payload).encode()).decode()
+    r = requests.post(BASE + '/handshake/send', json={'recipient': sender, 'payload': response_b64},
+                      headers=auth_headers())
+    if r.status_code == 200:
+        print(f"{DIVINE_FLARE} Accepted handshake {handshake_id} from {sender}. Chat key established.")
+    else:
+        print(f"{DIVINE_FLARE} Failed to send handshake acceptance: {r.status_code} {r.text}")
+def inbox():
+    if not ensure_logged_in():
+        return
+    r = requests.get(BASE + '/message/get', headers=auth_headers())
+    if r.status_code != 200:
+        print(f"{DIVINE_FLARE} Failed to fetch inbox {r.status_code}: {r.text}")
         return
     j = r.json()
     msgs = j.get('messages', [])
-    root_key = LOCAL['root_key']
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'chimera-aead')
-    aead_key = hkdf.derive(root_key)
-    aead = ChaCha20Poly1305(aead_key)
-    for i, m in enumerate(msgs):
+    if not msgs:
+        print(f"{DIVINE_FLARE} Inbox empty.")
+        return
+    for m in msgs:
+        sender = m.get('sender', '<unknown>')
+        message_id = m.get('id')
+        chat_secret = LOCAL['peer_chat_keys'].get(sender)
+        if not chat_secret:
+            print(f"{DIVINE_FLARE} Missing chat key for {sender}. Unable to decrypt message {message_id}.")
+            continue
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                   info=b'chimera-aead-' + sender.encode())
+        aead_key = hkdf.derive(chat_secret)
+        aead = ChaCha20Poly1305(aead_key)
         ct = b64decode(m['ciphertext'])
         nonce = b64decode(m['nonce'])
+        aad_b64 = m.get('aad')
+        aad = b64decode(aad_b64) if aad_b64 else b''
         try:
-            pt = aead.decrypt(nonce, ct, b'')
-            print(f"Message {i}:", pt.decode())
-        except Exception as e:
-            print(f"Message {i}: failed to decrypt: {e}")
+            plaintext = aead.decrypt(nonce, ct, aad)
+            print(f"{DIVINE_FLARE} Message {message_id} from {sender}: {plaintext.decode(errors='replace')}")
+        except Exception as exc:
+            print(f"{DIVINE_FLARE} Failed to decrypt message {message_id} from {sender}: {exc}")
 
 
 def usage():
     print('Usage:')
     print('  python client.py register USER PASS')
-    print('  python client.py register_save_salt USER PASS  # demo only (insecure)')
+    print('  python client.py register_save_salt USER PASS  # stores salt locally (demo)')
     print('  python client.py login USER PASS')
-    print('  python client.py send "message text"')
+    print('  python client.py handshake_offer RECIPIENT')
+    print('  python client.py handshake_poll [keep]')
+    print('  python client.py handshake_accept HANDSHAKE_ID')
+    print('  python client.py send RECIPIENT "message text"')
     print('  python client.py inbox')
 
 
@@ -191,8 +418,19 @@ if __name__ == '__main__':
         register_and_save_salt(sys.argv[2], sys.argv[3])
     elif cmd == 'login' and len(sys.argv) == 4:
         login(sys.argv[2], sys.argv[3])
-    elif cmd == 'send' and len(sys.argv) == 3:
-        encrypt_and_send(sys.argv[2])
+    elif cmd == 'handshake_offer' and len(sys.argv) == 3:
+        handshake_offer(sys.argv[2])
+    elif cmd == 'handshake_poll':
+        consume = True
+        if len(sys.argv) == 3 and sys.argv[2].lower() == 'keep':
+            consume = False
+        handshake_poll(consume=consume)
+    elif cmd == 'handshake_accept' and len(sys.argv) == 3:
+        handshake_accept(sys.argv[2])
+    elif cmd == 'send' and len(sys.argv) >= 4:
+        recipient = sys.argv[2]
+        message = ' '.join(sys.argv[3:])
+        encrypt_and_send(recipient, message)
     elif cmd == 'inbox':
         inbox()
     else:
